@@ -46,45 +46,6 @@ def extract_links(text: str):
     return seen
 
 
-PRIVATE_INVITE_RE = re.compile(r"t\.me/(\+|joinchat/)", re.IGNORECASE)
-TME_USERNAME_RE = re.compile(r"t\.me/([A-Za-z0-9_]{4,32})\b", re.IGNORECASE)
-
-
-async def is_group_link(bot, link: str) -> bool:
-    """
-    Returns True if the link should be treated as a group (public or private),
-    False if it resolves to a channel (or can't be confirmed as a group).
-    Non-Telegram links (not t.me / @username) are always kept, since they
-    can't be a Telegram channel.
-    """
-    link = link.strip()
-
-    # Private invite links (t.me/+xxxx or t.me/joinchat/xxxx) can't be resolved
-    # by the bot API without joining, so we can't tell group vs channel here.
-    # We keep them by default (best effort) since most shared invite links of
-    # this kind in a bio tend to be groups.
-    if PRIVATE_INVITE_RE.search(link):
-        return True
-
-    username = None
-    m = TME_USERNAME_RE.search(link)
-    if m:
-        username = m.group(1)
-    elif link.startswith("@"):
-        username = link[1:]
-
-    if username is None:
-        # Not a t.me/@username style link at all -> can't be a Telegram channel
-        return True
-
-    try:
-        chat = await bot.get_chat(f"@{username}")
-    except Exception:
-        # Can't resolve (private user, doesn't exist, etc.) -> can't confirm it's a group
-        return False
-
-    return chat.type in ("group", "supergroup")
-
 
 # ---------------- Panel ----------------
 
@@ -194,15 +155,7 @@ async def check_bio_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     bio = getattr(chat, "bio", None) or ""
-    raw_links = extract_links(bio)
-
-    current_links = []
-    for link in raw_links:
-        try:
-            if await is_group_link(context.bot, link):
-                current_links.append(link)
-        except Exception as e:
-            logger.warning(f"link classification failed for {link}: {e}")
+    current_links = extract_links(bio)
 
     last_links = await db.get_last_links(user_id, chat_id)
 
