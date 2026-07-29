@@ -141,6 +141,85 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------------- Diagnostics ----------------
+
+async def checkbio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "استفاده:\n/checkbio <آیدی عددی کاربر>\n\n"
+            "این دستور همین الان بیوی اون کاربر رو می‌خونه و گزارش کامل میده، "
+            "بدون اینکه منتظر چک دوره‌ای بمونیم."
+        )
+        return
+
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("آیدی عددی معتبر نیست.")
+        return
+
+    lines = [f"🔍 دیباگ کاربر {target_id}"]
+
+    # 1. Can we fetch the chat at all?
+    try:
+        chat = await context.bot.get_chat(target_id)
+    except Exception as e:
+        lines.append(f"❌ get_chat شکست خورد: {e}")
+        lines.append("→ یعنی ربات هیچ اطلاعاتی از این کاربر نداره (نه پیامی ازش دیده نه چتی باهاش داشته).")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    lines.append(f"✅ get_chat موفق بود. نام: {chat.full_name or '—'}")
+
+    bio = getattr(chat, "bio", None)
+    if bio is None:
+        lines.append(
+            "⚠️ فیلد bio اصلاً برنگشت (None). طبق محدودیت تلگرام، این یعنی این کاربر "
+            "هنوز خصوصاً و مستقیم با ربات چت (/start) نزده. تا وقتی این کارو نکنه، "
+            "بیوش برای ربات قابل‌خوندن نیست — فرقی نمی‌کنه چقدر توی گروه پیام بده."
+        )
+    else:
+        lines.append(f"📄 متن بیو: {bio!r}")
+        links = extract_links(bio)
+        lines.append(f"🔗 لینک‌های استخراج‌شده: {links if links else 'هیچی پیدا نشد'}")
+
+    # 2. Log channel status
+    log_channel = await db.get_log_channel()
+    if not log_channel:
+        lines.append("❌ کانال لاگ توی دیتابیس تنظیم نشده.")
+    else:
+        lines.append(f"✅ کانال لاگ: {log_channel}")
+        try:
+            member = await context.bot.get_chat_member(log_channel, context.bot.id)
+            lines.append(f"✅ وضعیت ربات توی کانال لاگ: {member.status}")
+        except Exception as e:
+            lines.append(f"❌ نتونستم وضعیت ربات توی کانال لاگ رو چک کنم: {e}")
+        try:
+            await context.bot.send_message(log_channel, "🧪 پیام تست از /checkbio — اگه اینو می‌بینی، ارسال به کانال لاگ سالمه.")
+            lines.append("✅ پیام تست با موفقیت به کانال لاگ ارسال شد.")
+        except Exception as e:
+            lines.append(f"❌ ارسال پیام تست به کانال لاگ شکست خورد: {e}")
+
+    # 3. Monitoring records for this user (across all chats)
+    all_monitored = await db.get_all_monitored()
+    records = [d for d in all_monitored if d.get("user_id") == target_id]
+    if not records:
+        lines.append("ℹ️ این کاربر توی هیچ گروهی هنوز به‌عنوان مانیتورشونده ثبت نشده (یعنی هنوز پیامی توی گروه‌های تحت پوشش نداده).")
+    else:
+        for r in records:
+            lines.append(
+                f"— گروه {r.get('chat_id')}: last_links ذخیره‌شده = {r.get('last_links')}, "
+                f"sent_links = {r.get('sent_links', [])}"
+            )
+
+    await update.message.reply_text("\n".join(lines))
+
+
 # ---------------- Bio monitoring ----------------
 
 async def check_bio_job(context: ContextTypes.DEFAULT_TYPE):
@@ -268,6 +347,7 @@ def main():
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("panel", start))
+    app.add_handler(CommandHandler("checkbio", checkbio_command))
     app.add_handler(CallbackQueryHandler(panel_callback))
     app.add_handler(
         MessageHandler(
