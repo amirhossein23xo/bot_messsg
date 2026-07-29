@@ -14,7 +14,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import BOT_TOKEN, ADMIN_IDS, BIO_CHECK_INTERVAL_SECONDS, LINK_PATTERN, PORT
+from config import BOT_TOKEN, MONGO_URI, ADMIN_IDS, BIO_CHECK_INTERVAL_SECONDS, LINK_PATTERN, PORT
 from database import Database
 
 logging.basicConfig(
