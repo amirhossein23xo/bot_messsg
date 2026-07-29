@@ -44,6 +44,46 @@ def extract_links(text: str):
     return seen
 
 
+PRIVATE_INVITE_RE = re.compile(r"t\.me/(\+|joinchat/)", re.IGNORECASE)
+TME_USERNAME_RE = re.compile(r"t\.me/([A-Za-z0-9_]{4,32})\b", re.IGNORECASE)
+
+
+async def is_group_link(bot, link: str) -> bool:
+    """
+    Returns True if the link should be treated as a group (public or private),
+    False if it resolves to a channel (or can't be confirmed as a group).
+    Non-Telegram links (not t.me / @username) are always kept, since they
+    can't be a Telegram channel.
+    """
+    link = link.strip()
+
+    # Private invite links (t.me/+xxxx or t.me/joinchat/xxxx) can't be resolved
+    # by the bot API without joining, so we can't tell group vs channel here.
+    # We keep them by default (best effort) since most shared invite links of
+    # this kind in a bio tend to be groups.
+    if PRIVATE_INVITE_RE.search(link):
+        return True
+
+    username = None
+    m = TME_USERNAME_RE.search(link)
+    if m:
+        username = m.group(1)
+    elif link.startswith("@"):
+        username = link[1:]
+
+    if username is None:
+        # Not a t.me/@username style link at all -> can't be a Telegram channel
+        return True
+
+    try:
+        chat = await bot.get_chat(f"@{username}")
+    except Exception:
+        # Can't resolve (private user, doesn't exist, etc.) -> can't confirm it's a group
+        return False
+
+    return chat.type in ("group", "supergroup")
+
+
 # ---------------- Panel ----------------
 
 def main_menu_keyboard():
@@ -109,17 +149,24 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     try:
-        await context.bot.send_chat_action(chat_id=channel_id, action="typing")
+        chat = await context.bot.get_chat(channel_id)
+        bot_member = await context.bot.get_chat_member(channel_id, context.bot.id)
+        if bot_member.status not in ("administrator", "creator"):
+            await update.message.reply_text(
+                "ربات توی این کانال ادمین نیست. اول ربات رو ادمین کانال کن، بعد دوباره امتحان کن."
+            )
+            return
     except Exception as e:
         await update.message.reply_text(
-            f"نتونستم به این کانال دسترسی پیدا کنم. مطمئن شو ربات ادمین کانال هست.\nخطا: {e}"
+            f"نتونستم به این کانال دسترسی پیدا کنم. مطمئن شو آیدی درسته و ربات عضو/ادمین کانال هست.\nخطا: {e}"
         )
         return
 
     await db.set_log_channel(channel_id)
     context.user_data[WAITING_LOG_CHANNEL] = False
     await update.message.reply_text(
-        "✅ کانال لاگ با موفقیت تنظیم شد.", reply_markup=main_menu_keyboard()
+        f"✅ کانال لاگ با موفقیت روی «{chat.title or channel_id}» تنظیم شد.",
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -137,7 +184,16 @@ async def check_bio_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     bio = getattr(chat, "bio", None) or ""
-    current_links = extract_links(bio)
+    raw_links = extract_links(bio)
+
+    current_links = []
+    for link in raw_links:
+        try:
+            if await is_group_link(context.bot, link):
+                current_links.append(link)
+        except Exception as e:
+            logger.warning(f"link classification failed for {link}: {e}")
+
     last_links = await db.get_last_links(user_id, chat_id)
 
     new_links = [l for l in current_links if l not in last_links]
@@ -204,6 +260,10 @@ async def post_init(app: Application):
     asyncio.create_task(run_health_server())
 
 
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled exception while processing update:", exc_info=context.error)
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN env var is not set")
@@ -212,6 +272,7 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("panel", start))
     app.add_handler(CallbackQueryHandler(panel_callback))
