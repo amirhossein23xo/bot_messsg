@@ -1,5 +1,6 @@
 import logging
 import re
+import html
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -259,22 +260,33 @@ async def check_bio_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"could not fetch group title for {chat_id}: {e}")
 
-            links_lines = []
-            for link in new_links:
-                status = "\U0001F195 جدید" if link not in sent_before else "\u267B\uFE0F تکراری (قبلا هم ارسال شده)"
-                links_lines.append(f"\u2022 {link}\n  {status}")
+            new_only = [l for l in new_links if l not in sent_before]
+            duplicate_only = [l for l in new_links if l in sent_before]
+
+            def esc(s):
+                return html.escape(str(s))
+
+            sections = []
+            if new_only:
+                block = "\n".join(f"• <code>{esc(l)}</code>" for l in new_only)
+                sections.append(f"🆕 <b>لینک‌های جدید:</b>\n{block}")
+            if duplicate_only:
+                block = "\n".join(f"• <code>{esc(l)}</code>" for l in duplicate_only)
+                sections.append(f"♻️ <b>لینک‌های تکراری (قبلاً هم ارسال شده):</b>\n{block}")
 
             text = (
-                "\U0001F514 لینک جدید در بیوگرافی یک کاربر پیدا شد\n\n"
-                f"\U0001F464 کاربر: {full_name}\n"
-                f"\U0001F517 یوزرنیم: {username}\n"
-                f"\U0001F194 آیدی عددی: {user_id}\n"
-                f"\U0001F465 گروه: {group_title}\n"
-                f"\U0001F550 زمان: {now_str}\n\n"
-                f"\U0001F517 لینک(های) یافت‌شده در بیو:\n" + "\n".join(links_lines)
+                "🔔 <b>لینک جدید در بیوگرافی یک کاربر پیدا شد</b>\n"
+                "———————————————\n"
+                f"👤 کاربر: <b>{esc(full_name)}</b>\n"
+                f"🔗 یوزرنیم: {esc(username)}\n"
+                f"🆔 آیدی عددی: <code>{user_id}</code>\n"
+                f"👥 گروه: {esc(group_title)}\n"
+                f"🕐 زمان: {esc(now_str)}\n"
+                "———————————————\n"
+                + "\n\n".join(sections)
             )
             try:
-                await context.bot.send_message(log_channel, text)
+                await context.bot.send_message(log_channel, text, parse_mode="HTML")
                 await db.add_sent_links(user_id, chat_id, new_links)
             except Exception as e:
                 logger.warning(f"failed to send to log channel: {e}")
@@ -283,17 +295,20 @@ async def check_bio_job(context: ContextTypes.DEFAULT_TYPE):
         await db.update_last_links(user_id, chat_id, current_links)
 
 
-def schedule_bio_job(app: Application, user_id: int, chat_id: int):
+async def schedule_bio_job(app: Application, user_id: int, chat_id: int):
     name = job_name(user_id, chat_id)
     if app.job_queue.get_jobs_by_name(name):
         return  # already scheduled, don't duplicate
-    app.job_queue.run_repeating(
+    job = app.job_queue.run_repeating(
         check_bio_job,
         interval=BIO_CHECK_INTERVAL_SECONDS,
-        first=0,  # check once immediately, then every interval
         data={"user_id": user_id, "chat_id": chat_id},
         name=name,
     )
+    # NOTE: passing first=0 to run_repeating does NOT run the job immediately
+    # (this is a documented APScheduler limitation), so we force the first
+    # run explicitly here instead of waiting for the first 2-hour interval.
+    await job.run(app)
 
 
 async def track_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -306,13 +321,13 @@ async def track_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id
     if not await db.is_monitored(user.id, chat_id):
         await db.add_monitored(user.id, chat_id)
-        schedule_bio_job(context.application, user.id, chat_id)
+        await schedule_bio_job(context.application, user.id, chat_id)
 
 
 async def restore_jobs(app: Application):
     monitored = await db.get_all_monitored()
     for doc in monitored:
-        schedule_bio_job(app, doc["user_id"], doc["chat_id"])
+        await schedule_bio_job(app, doc["user_id"], doc["chat_id"])
     logger.info(f"Restored {len(monitored)} bio-check jobs after restart.")
 
 

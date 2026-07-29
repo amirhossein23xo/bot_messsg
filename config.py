@@ -10,7 +10,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 ADMIN_IDS = {8347908205, 6781649757}
 
 # How often (seconds) a monitored user's bio is re-checked.
-BIO_CHECK_INTERVAL_SECONDS = 2 * 60 * 60  # 2 hours
+BIO_CHECK_INTERVAL_SECONDS = 1 * 60 * 60  # 1 hour
 
 # Matches http(s) links, t.me links, and @username mentions inside a bio.
 LINK_PATTERN = r"(https?://\S+|t\.me/\S+|@\w{4,32})"
