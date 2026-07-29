@@ -50,3 +50,17 @@ class Database:
             {"$set": {"last_links": links}},
             upsert=True,
         )
+
+    # ---- links ever sent to the log channel (for new/duplicate detection) ----
+    async def get_sent_links(self, user_id: int, chat_id: int):
+        doc = await self.users.find_one({"user_id": user_id, "chat_id": chat_id})
+        return doc.get("sent_links", []) if doc else []
+
+    async def add_sent_links(self, user_id: int, chat_id: int, links: list):
+        if not links:
+            return
+        await self.users.update_one(
+            {"user_id": user_id, "chat_id": chat_id},
+            {"$addToSet": {"sent_links": {"$each": links}}},
+            upsert=True,
+        )

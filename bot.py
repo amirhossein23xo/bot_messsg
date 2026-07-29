@@ -1,6 +1,8 @@
 import logging
 import re
 import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -137,8 +139,9 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     channel_id = None
-    if update.message.forward_from_chat:
-        channel_id = update.message.forward_from_chat.id
+    origin = update.message.forward_origin
+    if origin and getattr(origin, "type", None) == "channel":
+        channel_id = origin.chat.id
     elif update.message.text:
         try:
             channel_id = int(update.message.text.strip())
@@ -162,7 +165,14 @@ async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await db.set_log_channel(channel_id)
+    try:
+        await db.set_log_channel(channel_id)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ کانال لاگ توی تلگرام تایید شد ولی ذخیره‌ش توی دیتابیس با خطا مواجه شد.\nخطا: {e}"
+        )
+        return
+
     context.user_data[WAITING_LOG_CHANNEL] = False
     await update.message.reply_text(
         f"✅ کانال لاگ با موفقیت روی «{chat.title or channel_id}» تنظیم شد.",
@@ -200,10 +210,40 @@ async def check_bio_job(context: ContextTypes.DEFAULT_TYPE):
     if new_links:
         log_channel = await db.get_log_channel()
         if log_channel:
-            username = f"@{chat.username}" if chat.username else str(user_id)
-            text = f"\U0001F517 لینک جدید در بیوی {username}:\n" + "\n".join(new_links)
+            sent_before = set(await db.get_sent_links(user_id, chat_id))
+
+            full_name = chat.full_name if getattr(chat, "full_name", None) else str(user_id)
+            username = f"@{chat.username}" if chat.username else "ندارد"
+
+            try:
+                now_str = datetime.now(ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            group_title = str(chat_id)
+            try:
+                group_chat = await context.bot.get_chat(chat_id)
+                group_title = group_chat.title or group_title
+            except Exception as e:
+                logger.warning(f"could not fetch group title for {chat_id}: {e}")
+
+            links_lines = []
+            for link in new_links:
+                status = "\U0001F195 جدید" if link not in sent_before else "\u267B\uFE0F تکراری (قبلا هم ارسال شده)"
+                links_lines.append(f"\u2022 {link}\n  {status}")
+
+            text = (
+                "\U0001F514 لینک جدید در بیوگرافی یک کاربر پیدا شد\n\n"
+                f"\U0001F464 کاربر: {full_name}\n"
+                f"\U0001F517 یوزرنیم: {username}\n"
+                f"\U0001F194 آیدی عددی: {user_id}\n"
+                f"\U0001F465 گروه: {group_title}\n"
+                f"\U0001F550 زمان: {now_str}\n\n"
+                f"\U0001F517 لینک(های) یافت‌شده در بیو:\n" + "\n".join(links_lines)
+            )
             try:
                 await context.bot.send_message(log_channel, text)
+                await db.add_sent_links(user_id, chat_id, new_links)
             except Exception as e:
                 logger.warning(f"failed to send to log channel: {e}")
 
