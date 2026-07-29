@@ -8,6 +8,7 @@ class Database:
         self.db = self.client["bio_watcher"]
         self.settings = self.db["settings"]
         self.users = self.db["monitored_users"]
+        self.user_links = self.db["user_sent_links"]  # global, per-user, across all groups
 
     # ---- log channel ----
     async def get_log_channel(self):
@@ -51,16 +52,17 @@ class Database:
             upsert=True,
         )
 
-    # ---- links ever sent to the log channel (for new/duplicate detection) ----
-    async def get_sent_links(self, user_id: int, chat_id: int):
-        doc = await self.users.find_one({"user_id": user_id, "chat_id": chat_id})
+    # ---- links ever sent to the log channel (global per user, across ALL
+    # groups they're monitored in) — this is what decides "جدید" vs "تکراری" ----
+    async def get_sent_links(self, user_id: int):
+        doc = await self.user_links.find_one({"user_id": user_id})
         return doc.get("sent_links", []) if doc else []
 
-    async def add_sent_links(self, user_id: int, chat_id: int, links: list):
+    async def add_sent_links(self, user_id: int, links: list):
         if not links:
             return
-        await self.users.update_one(
-            {"user_id": user_id, "chat_id": chat_id},
+        await self.user_links.update_one(
+            {"user_id": user_id},
             {"$addToSet": {"sent_links": {"$each": links}}},
             upsert=True,
         )

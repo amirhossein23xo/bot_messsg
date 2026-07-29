@@ -6,7 +6,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CopyTextButton
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -17,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 
-from config import BOT_TOKEN, MONGO_URI, ADMIN_IDS, BIO_CHECK_INTERVAL_SECONDS, LINK_PATTERN, PORT
+from config import BOT_TOKEN, MONGO_URI, ADMIN_IDS, BIO_CHECK_INTERVAL_SECONDS, PORT
 from database import Database
 
 logging.basicConfig(
@@ -27,7 +27,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 db = Database()
-LINK_RE = re.compile(LINK_PATTERN)
+
+# Only Telegram t.me links / @mentions are candidates — no generic websites.
+INVITE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)([\w-]{4,})", re.IGNORECASE)
+USERNAME_LINK_RE = re.compile(r"(?:https?://)?t\.me/([a-zA-Z]\w{3,31})\b", re.IGNORECASE)
+MENTION_RE = re.compile(r"@([a-zA-Z]\w{3,31})\b")
 
 WAITING_LOG_CHANNEL = "waiting_log_channel"
 
@@ -40,11 +44,53 @@ def job_name(user_id: int, chat_id: int) -> str:
     return f"biocheck_{chat_id}_{user_id}"
 
 
-def extract_links(text: str):
+async def extract_group_links(bot, text: str):
+    """Return only links that point to an actual Telegram GROUP/SUPERGROUP —
+    never channels, bots, or ordinary websites.
+
+    - t.me/+xxxx and t.me/joinchat/xxxx (private invite links) can't be
+      verified by a bot without joining them, so they're kept as-is
+      (this is the standard way private groups get shared).
+    - t.me/username and @username are verified live via get_chat: only kept
+      if the resolved chat.type is "group" or "supergroup" — this
+      automatically excludes channels (type "channel") and bots/regular
+      users (type "private").
+    """
     if not text:
         return []
-    seen = list(dict.fromkeys(LINK_RE.findall(text)))  # dedupe, keep order
-    return seen
+
+    seen = set()
+    results = []
+
+    for m in INVITE_LINK_RE.finditer(text):
+        link = f"https://t.me/+{m.group(1)}"
+        if link not in seen:
+            seen.add(link)
+            results.append(link)
+
+    candidate_usernames = []
+    for m in USERNAME_LINK_RE.finditer(text):
+        uname = m.group(1)
+        if uname.lower() == "joinchat":
+            continue
+        candidate_usernames.append(uname)
+    for m in MENTION_RE.finditer(text):
+        candidate_usernames.append(m.group(1))
+
+    for uname in dict.fromkeys(candidate_usernames):  # dedupe, keep order
+        link = f"https://t.me/{uname}"
+        if link in seen:
+            continue
+        seen.add(link)
+        try:
+            chat = await bot.get_chat(f"@{uname}")
+        except Exception:
+            continue  # can't resolve -> skip rather than guess
+        if chat.type in ("group", "supergroup"):
+            results.append(link)
+
+    return results
+
 
 
 
@@ -186,8 +232,8 @@ async def checkbio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         lines.append(f"📄 متن بیو: {bio!r}")
-        links = extract_links(bio)
-        lines.append(f"🔗 لینک‌های استخراج‌شده: {links if links else 'هیچی پیدا نشد'}")
+        links = await extract_group_links(context.bot, bio)
+        lines.append(f"🔗 لینک‌های گروه تشخیص‌داده‌شده: {links if links else 'هیچی پیدا نشد'}")
 
     # 2. Log channel status
     log_channel = await db.get_log_channel()
@@ -213,10 +259,9 @@ async def checkbio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("ℹ️ این کاربر توی هیچ گروهی هنوز به‌عنوان مانیتورشونده ثبت نشده (یعنی هنوز پیامی توی گروه‌های تحت پوشش نداده).")
     else:
         for r in records:
-            lines.append(
-                f"— گروه {r.get('chat_id')}: last_links ذخیره‌شده = {r.get('last_links')}, "
-                f"sent_links = {r.get('sent_links', [])}"
-            )
+            lines.append(f"— گروه {r.get('chat_id')}: last_links ذخیره‌شده = {r.get('last_links')}")
+        global_sent = await db.get_sent_links(target_id)
+        lines.append(f"📤 لینک‌هایی که تا الان (توی هر گروهی) براش ارسال شده: {global_sent if global_sent else 'هیچی'}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -235,61 +280,63 @@ async def check_bio_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     bio = getattr(chat, "bio", None) or ""
-    current_links = extract_links(bio)
+    current_links = await extract_group_links(context.bot, bio)
 
     last_links = await db.get_last_links(user_id, chat_id)
 
     new_links = [l for l in current_links if l not in last_links]
     if new_links:
-        log_channel = await db.get_log_channel()
-        if log_channel:
-            sent_before = set(await db.get_sent_links(user_id, chat_id))
+        sent_before = set(await db.get_sent_links(user_id))
+        to_announce = [l for l in new_links if l not in sent_before]
 
-            full_name = chat.full_name if getattr(chat, "full_name", None) else str(user_id)
-            username = f"@{chat.username}" if chat.username else "ندارد"
+        if to_announce:
+            log_channel = await db.get_log_channel()
+            if log_channel:
+                full_name = chat.full_name if getattr(chat, "full_name", None) else str(user_id)
+                username = f"@{chat.username}" if chat.username else "ندارد"
 
-            try:
-                now_str = datetime.now(ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                try:
+                    now_str = datetime.now(ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-            group_title = str(chat_id)
-            try:
-                group_chat = await context.bot.get_chat(chat_id)
-                group_title = group_chat.title or group_title
-            except Exception as e:
-                logger.warning(f"could not fetch group title for {chat_id}: {e}")
+                group_title = str(chat_id)
+                try:
+                    group_chat = await context.bot.get_chat(chat_id)
+                    group_title = group_chat.title or group_title
+                except Exception as e:
+                    logger.warning(f"could not fetch group title for {chat_id}: {e}")
 
-            new_only = [l for l in new_links if l not in sent_before]
-            duplicate_only = [l for l in new_links if l in sent_before]
+                def esc(s):
+                    return html.escape(str(s))
 
-            def esc(s):
-                return html.escape(str(s))
+                links_block = "\n".join(f"• {esc(l)}" for l in to_announce)
 
-            sections = []
-            if new_only:
-                block = "\n".join(f"• <code>{esc(l)}</code>" for l in new_only)
-                sections.append(f"🆕 <b>لینک‌های جدید:</b>\n{block}")
-            if duplicate_only:
-                block = "\n".join(f"• <code>{esc(l)}</code>" for l in duplicate_only)
-                sections.append(f"♻️ <b>لینک‌های تکراری (قبلاً هم ارسال شده):</b>\n{block}")
+                text = (
+                    "🔔 <b>لینک گروه جدید در بیوگرافی یک کاربر پیدا شد</b>\n"
+                    "———————————————\n"
+                    f"👤 کاربر: <b>{esc(full_name)}</b>\n"
+                    f"🔗 یوزرنیم: {esc(username)}\n"
+                    f"🆔 آیدی عددی: <code>{user_id}</code>\n"
+                    f"👥 گروه: {esc(group_title)}\n"
+                    f"🕐 زمان: {esc(now_str)}\n"
+                    "———————————————\n"
+                    f"🆕 <b>لینک‌های جدید:</b>\n{links_block}"
+                )
 
-            text = (
-                "🔔 <b>لینک جدید در بیوگرافی یک کاربر پیدا شد</b>\n"
-                "———————————————\n"
-                f"👤 کاربر: <b>{esc(full_name)}</b>\n"
-                f"🔗 یوزرنیم: {esc(username)}\n"
-                f"🆔 آیدی عددی: <code>{user_id}</code>\n"
-                f"👥 گروه: {esc(group_title)}\n"
-                f"🕐 زمان: {esc(now_str)}\n"
-                "———————————————\n"
-                + "\n\n".join(sections)
-            )
-            try:
-                await context.bot.send_message(log_channel, text, parse_mode="HTML")
-                await db.add_sent_links(user_id, chat_id, new_links)
-            except Exception as e:
-                logger.warning(f"failed to send to log channel: {e}")
+                keyboard_rows = []
+                for idx, link in enumerate(to_announce, start=1):
+                    label = "📋 کپی لینک" if len(to_announce) == 1 else f"📋 کپی لینک {idx}"
+                    keyboard_rows.append([InlineKeyboardButton(label, copy_text=CopyTextButton(text=link))])
+                reply_markup = InlineKeyboardMarkup(keyboard_rows)
+
+                try:
+                    await context.bot.send_message(log_channel, text, parse_mode="HTML", reply_markup=reply_markup)
+                    await db.add_sent_links(user_id, to_announce)
+                except Exception as e:
+                    logger.warning(f"failed to send to log channel: {e}")
+        # else: every link we just found was already announced for this user
+        # in some other group before — say nothing, don't re-send.
 
     if current_links != last_links:
         await db.update_last_links(user_id, chat_id, current_links)
