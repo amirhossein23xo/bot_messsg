@@ -66,3 +66,30 @@ class Database:
             {"$addToSet": {"sent_links": {"$each": links}}},
             upsert=True,
         )
+
+    async def claim_link(self, user_id: int, link: str) -> bool:
+        """Atomically mark `link` as sent for this user, but ONLY if it
+        hasn't been claimed before.
+
+        Returns True  -> this call just became the first to send it (go ahead, send it).
+        Returns False -> someone (this process or another one) already sent it before;
+                          do NOT send it again.
+
+        This is done as a single atomic MongoDB operation (find-and-update with
+        a "link not already in the array" filter) specifically so that even if
+        two instances of the bot end up running at the same time (e.g. an old
+        Railway deployment left running alongside a new one), only ONE of them
+        can ever win the race and actually send a given link. A plain
+        read-then-write (get_sent_links + add_sent_links) can NOT guarantee
+        this, because two processes can both "read: not sent yet" before
+        either one "writes: now sent".
+        """
+        result = await self.user_links.update_one(
+            {"user_id": user_id, "sent_links": {"$ne": link}},
+            {"$addToSet": {"sent_links": link}},
+            upsert=True,
+        )
+        # matched_count == 1  -> doc existed and didn't have this link -> we just added it -> WE claimed it
+        # upserted_id is set  -> doc didn't exist at all yet -> we just created it with this link -> WE claimed it
+        # matched_count == 0 and upserted_id is None -> doc existed AND already had this link -> already claimed by someone else
+        return result.matched_count == 1 or result.upserted_id is not None

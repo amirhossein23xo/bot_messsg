@@ -286,8 +286,13 @@ async def check_bio_job(context: ContextTypes.DEFAULT_TYPE):
 
     new_links = [l for l in current_links if l not in last_links]
     if new_links:
-        sent_before = set(await db.get_sent_links(user_id))
-        to_announce = [l for l in new_links if l not in sent_before]
+        # Atomically claim each candidate link. If two bot processes are
+        # somehow running at once (leftover Railway deployment, etc.) and
+        # both wake up on this same user at the same time, only one of
+        # them will win the claim for a given link — the other will get
+        # False back and skip it, so it's physically impossible for the
+        # same link to be sent twice, even under a race.
+        to_announce = [l for l in new_links if await db.claim_link(user_id, l)]
 
         if to_announce:
             log_channel = await db.get_log_channel()
@@ -332,9 +337,13 @@ async def check_bio_job(context: ContextTypes.DEFAULT_TYPE):
 
                 try:
                     await context.bot.send_message(log_channel, text, parse_mode="HTML", reply_markup=reply_markup)
-                    await db.add_sent_links(user_id, to_announce)
                 except Exception as e:
-                    logger.warning(f"failed to send to log channel: {e}")
+                    # NOTE: the links in `to_announce` were already atomically
+                    # claimed above, so even though this particular send
+                    # failed, they will NOT be retried on the next check —
+                    # this keeps the "never send the same link twice"
+                    # guarantee airtight instead of trading it for retries.
+                    logger.warning(f"failed to send to log channel (links were already claimed, will not retry): {e}")
         # else: every link we just found was already announced for this user
         # in some other group before — say nothing, don't re-send.
 
